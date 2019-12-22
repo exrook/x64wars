@@ -1,3 +1,6 @@
+use std::thread;
+use std::sync::{Arc,Barrier};
+
 use kvm_ioctls::{Kvm, VmFd, VcpuFd, VcpuExit};
 use memmap::{MmapOptions,MmapMut};
 use rand::seq::SliceRandom;
@@ -10,7 +13,12 @@ fn main() {
     let mut mem = MemAlloc::new(mem_size);
 
     let x86_code = [
-        0xb8, 0x40, 0x00, 0x00, 0x00, 0xf4, /* mov rax, 64 */
+        0xb8, 0x40, 0x00, 0x00, 0x00, /* mov rax, 64 */
+        0xf4,             /* hlt */
+    ];
+
+    let x86_code_2 = [
+        0xb8, 0x80, 0x00, 0x00, 0x00, /* mov rax, 128 */
         0xf4,             /* hlt */
     ];
 
@@ -21,7 +29,25 @@ fn main() {
 
     let cr3 = mem.load(&x86_code, 0x1000);
 
-    run64bit(mem.consume(), 0x1000, cr3);
+    let cr3_2 = mem.load(&x86_code_2, 0x1000);
+
+    let mut vm = VM::new(mem.consume());
+    let core1 = vm.new_core();
+    let core2 = vm.new_core();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let b1 = barrier.clone();
+    let h1 = thread::spawn(move ||{
+        barrier.wait();
+        core1.run64bit(0x1000, cr3)
+    });
+    let h2 = thread::spawn(move ||{
+        b1.wait();
+        core2.run64bit(0x1000, cr3_2)
+    });
+    h1.join();
+    h2.join();
+    //run64bit(mem.consume(), 0x1000, cr3);
 
     println!("Hello, world!");
 }
@@ -200,58 +226,94 @@ impl MemAlloc {
     }
 }
 
-fn run64bit(mut mem: MmapMut, entry: u64, cr3: u64) {
-    let kvm = Kvm::new().unwrap();
+struct VM {
+    mem: MmapMut,
+    vmfd: VmFd,
+    next_vcpu_id: u8
+}
 
-    let vm = kvm.create_vm().unwrap();
+impl VM {
+    pub fn new(mut mem: MmapMut) -> Self {
+        let kvm = Kvm::new().unwrap();
 
-    //let guest_addr = 0x1000;
-    let guest_addr = entry;
-    let mem_region = kvm_bindings::kvm_userspace_memory_region {
-        slot: 0,
-        guest_phys_addr: 0,
-        memory_size: mem.len() as u64,
-        userspace_addr: (&mut mem[0] as *mut u8) as u64,
-        flags: 0
-    };
-    unsafe { vm.set_user_memory_region(mem_region).unwrap() }
+        let vm = kvm.create_vm().unwrap();
 
-    let vcpu = vm.create_vcpu(0).unwrap();
+        let mem_region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: 0,
+            memory_size: mem.len() as u64,
+            userspace_addr: (&mut mem[0] as *mut u8) as u64,
+            flags: 0
+        };
+        unsafe { vm.set_user_memory_region(mem_region).unwrap() };
+        Self {
+            mem: mem,
+            vmfd: vm,
+            next_vcpu_id: 0
+        }
+    }
+    pub fn new_core(&mut self) -> VMCore {
+        let c = VMCore::new(self.vmfd.create_vcpu(self.next_vcpu_id).unwrap());
+        self.next_vcpu_id += 1;
+        c
+    }
+}
 
-    let mut vcpu_sregs = vcpu.get_sregs().unwrap();
-    vcpu_sregs.cr4 = 0b10100000;
-    vcpu_sregs.cr3 = cr3; // TODO: point at page tables
-    vcpu_sregs.efer |= 0x00000500;
-    vcpu_sregs.cr0 |= 0x80000001;
+struct VMCore {
+    vcpu: VcpuFd
+}
 
-    vcpu_sregs.cs.db = 0;
-    vcpu_sregs.cs.l = 1;
-    vcpu_sregs.cs.present = 1;
-    vcpu_sregs.cs.dpl = 0;
-    vcpu_sregs.cs.type_ = 0b1000;
-    vcpu_sregs.cs.base = 0;
-    vcpu_sregs.cs.limit = 0;
+impl VMCore {
+    fn new(vcpu: VcpuFd) -> Self {
+        let mut vcpu_sregs = vcpu.get_sregs().unwrap();
+        vcpu_sregs.cr4 = 0b10100000;
+        //vcpu_sregs.cr3 = cr3; // TODO: point at page tables
+        vcpu_sregs.efer |= 0x00000500;
+        vcpu_sregs.cr0 |= 0x80000001;
 
-    vcpu.set_sregs(&vcpu_sregs).unwrap();
+        vcpu_sregs.cs.db = 0;
+        vcpu_sregs.cs.l = 1;
+        vcpu_sregs.cs.present = 1;
+        vcpu_sregs.cs.dpl = 0;
+        vcpu_sregs.cs.type_ = 0b1000;
+        vcpu_sregs.cs.base = 0;
+        vcpu_sregs.cs.limit = 0;
 
-    let mut vcpu_regs = vcpu.get_regs().unwrap();
-    vcpu_regs.rip = guest_addr;
-    vcpu.set_regs(&vcpu_regs).unwrap();
+        vcpu.set_sregs(&vcpu_sregs).unwrap();
 
-    loop {
-        match vcpu.run().expect("run failed") {
-            VcpuExit::Hlt => {
-                println!("Halt");
-                break;
-            }
-            exit_reason => {
-                println!("Unexpected exit reason: {:?}", exit_reason);
-                dbg!(vcpu.get_sregs());
-                break;
-            }
+        //let mut vcpu_regs = vcpu.get_regs().unwrap();
+        //vcpu_regs.rip = guest_addr;
+        //vcpu.set_regs(&vcpu_regs).unwrap();
+
+        Self {
+            vcpu
         }
     }
 
-    let vcpu_regs = vcpu.get_regs().unwrap();
-    println!("{:?}", vcpu_regs);
+    fn run64bit(&self, entry: u64, cr3: u64) {
+        let mut vcpu_sregs = self.vcpu.get_sregs().unwrap();
+        vcpu_sregs.cr3 = cr3; // TODO: point at page tables
+        self.vcpu.set_sregs(&vcpu_sregs).unwrap();
+
+        let mut vcpu_regs = self.vcpu.get_regs().unwrap();
+        vcpu_regs.rip = entry;
+        self.vcpu.set_regs(&vcpu_regs).unwrap();
+
+        loop {
+            match self.vcpu.run().expect("run failed") {
+                VcpuExit::Hlt => {
+                    println!("Halt");
+                    break;
+                }
+                exit_reason => {
+                    println!("Unexpected exit reason: {:?}", exit_reason);
+                    dbg!(self.vcpu.get_sregs());
+                    break;
+                }
+            }
+        }
+
+        let vcpu_regs = self.vcpu.get_regs().unwrap();
+        println!("{:?}", vcpu_regs);
+    }
 }
