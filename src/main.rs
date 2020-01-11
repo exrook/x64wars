@@ -21,14 +21,14 @@ fn main() {
 
     let elf1 = Elf::parse(&file1).unwrap();
 
-    println!("{:#?}", elf1);
+    //println!("{:#?}", elf1);
 
     let mut file2 = vec!();
     File::open("core2").unwrap().read_to_end(&mut file2).unwrap();
 
     let elf2 = Elf::parse(&file2).unwrap();
 
-    println!("{:#?}", elf2);
+    //println!("{:#?}", elf2);
 
     let x86_code = [
         0xb8, 0x40, 0x00, 0x00, 0x00, /* mov rax, 64 */
@@ -45,9 +45,11 @@ fn main() {
     //    mem[i] = *x
     //}
 
-    let cr3 = mem.load(&x86_code, 0x1000);
+    let cr3 = mem.create_pml4() * 4096;
+    mem.load(cr3 as usize, &x86_code, 0x1000);
 
-    let cr3_2 = mem.load(&x86_code_2, 0x1000);
+    let cr3_2 = mem.create_pml4() * 4096;
+    mem.load(cr3_2 as usize, &x86_code_2, 0x1000);
 
     let mut vm = VM::new(mem.consume());
     let core1 = vm.new_core();
@@ -63,8 +65,8 @@ fn main() {
         b1.wait();
         core2.run64bit(0x1000, cr3_2)
     });
-    h1.join();
-    h2.join();
+    h1.join().unwrap();
+    h2.join().unwrap();
     //run64bit(mem.consume(), 0x1000, cr3);
 
     println!("Hello, world!");
@@ -88,9 +90,10 @@ impl MemAlloc {
             free
         }
     }
+
     /// Load the provided code into memory, creating a page table with it allocated at the given
     /// `vaddr`, returning the address of the top level page table
-    pub fn load(&mut self, code: &[u8], vaddr: u64) -> u64 {
+    pub fn load(&mut self, pml4_address: usize, code: &[u8], vaddr: u64) -> u64 {
         assert_eq!(vaddr % 4096, 0, "vaddr must be a multiple of 4096");
         let mut pages = vec![];
         let mut count = 0;
@@ -106,7 +109,36 @@ impl MemAlloc {
             count += 4096
         }
 
-        self.create_map(&pages, vaddr) as u64
+        //let (pml4, _pt_pages) = self.create_map(&pages, vaddr);
+        let mut pt_pages = self.map_multiple(pml4_address, &pages, vaddr);
+
+        for i in 0..(self.backing.len() / 4096) {
+            self.map(pml4_address, i as u64 * 4096, 0xFFFF800000000000 + (i as u64 * 4096));
+        }
+        pml4_address as u64
+    }
+
+    /// Copy `code` to the location `base_vaddr` address in the `pml4_address` address space,
+    /// perserving existing mappings if present, creating new ones if not
+    pub fn load2(&mut self, pml4_address: usize, code: &[u8], base_vaddr: usize) {
+        let mut i = base_vaddr as usize;
+        let section_end = base_vaddr as usize + code.len() - 1;
+        loop {
+            let chunk_start = i;
+            let page_addr = (chunk_start / 4096)*4096;
+            let chunk_end = section_end.min(page_addr + 4095);
+
+            let backing_frame = self.lookup_or_allocate(pml4_address, page_addr);
+
+            let frame_start_offset = chunk_start % 4096;
+            let frame_end_offset = chunk_end % 4096;
+
+            let dest_slice = &mut self.get_frame_mut(backing_frame)[frame_start_offset..(frame_end_offset + 1)];
+            let src_slice = &code[(chunk_start - base_vaddr)..(chunk_end - base_vaddr)];
+            dest_slice.copy_from_slice(src_slice);
+
+            i = chunk_end + 1;
+        }
     }
 
     /// Return the backing memory
@@ -114,19 +146,19 @@ impl MemAlloc {
         self.backing
     }
 
-    /// Return an unused page
+    /// Return an unused frame
     fn next(&mut self) -> u64 {
-        self.free.pop().expect("Out of pages")
+        self.free.pop().expect("Out of frames")
     }
 
-    /// Peek at the next unused page
+    /// Peek at the next unused frame
     fn peek(&self) -> u64 {
-        *self.free.last().expect("Out of pages")
+        *self.free.last().expect("Out of frames")
     }
 
     /// Construct a page table mapping the given pages linearly starting from the given virtual
     /// base address, returning the address of the PML4
-    pub fn create_map(&mut self, pages: &[u64], mut vaddr: u64) -> usize {
+    pub fn create_map(&mut self, pages: &[u64], vaddr: u64) -> (usize, Vec<u64>) {
         assert_eq!(vaddr % 4096, 0, "vaddr must be a multiple of 4096");
         let mut pages = pages.to_vec();
 
@@ -135,12 +167,13 @@ impl MemAlloc {
         pages.push(pml4_frame_num);
 
         println!("{:?}: {:?}", pml4_address , pml4_frame_num);
-        let pt_pages = self.map_multiple(pml4_address, &pages, vaddr);
+        let mut pt_pages = self.map_multiple(pml4_address, &pages, vaddr);
+        pt_pages.push(pml4_frame_num);
 
-        pml4_address as usize
+        (pml4_address as usize, pt_pages)
     }
 
-    /// Construct a pml4
+    /// Construct a pml4, returning its frame number
     pub fn create_pml4(&mut self) -> u64 {
         let pml4_frame_num = self.next();
         let pml4_address = pml4_frame_num as usize * 4096;
@@ -150,48 +183,133 @@ impl MemAlloc {
         pml4_frame_num
     }
 
+    /// Lookup the frame for a given virtual address in the page tables anchored at `pml4_address`
+    fn lookup(&self, pml4_address: usize, vaddr: usize) -> Option<usize> {
+        //println!("Looking up {:x} in table at {:x}", vaddr, pml4_address);
+        let pml4 = self.pml4_as_ref(pml4_address);
+        let pml4_entry = pml4[pml4_index(vaddr.into())];
+        if !pml4_entry.is_present() { return None } 
+        let pdpt_address = pml4_entry.address();
+        let pdpt = self.pdpt_as_ref(pdpt_address.into());
+        let pdpt_entry = pdpt[pdpt_index(vaddr.into())];
+        if !pdpt_entry.is_present() { return None }
+        let pd_address = pdpt_entry.address();
+        let pd = self.pd_as_ref(pd_address.into());
+        let pd_entry = pd[pd_index(vaddr.into())];
+        if !pd_entry.is_present() { return None }
+        let pt_address = pd_entry.address();
+        let pt = self.pt_as_ref(pt_address.into());
+        let pt_entry = pt[pt_index(vaddr.into())];
+        if pt_entry.is_present() { 
+            Some(pt_entry.address().into())
+        } else {
+            None
+        }
+    }
+
+    fn lookup_page(&self, pml4_address: usize, vaddr: usize) -> Option<&[u8]> {
+        self.lookup(pml4_address, vaddr).map(|p|&self.backing[p..(p + 4096)])
+    }
+
+    fn get_frame(&self, frame_addr: usize) -> &[u8] {
+        assert!(frame_addr % 4096 == 0);
+        &self.backing[frame_addr..(frame_addr + 4096)]
+    }
+
+    fn get_frame_mut(&mut self, frame_addr: usize) -> &mut [u8] {
+        assert!(frame_addr % 4096 == 0);
+        &mut self.backing[frame_addr..(frame_addr + 4096)]
+    }
+
+    /// Lookup the frame for an address or allocate one
+    fn lookup_or_allocate(&mut self, pml4_address: usize, vaddr: usize) -> usize {
+        self.lookup(pml4_address, vaddr).unwrap_or_else(||{
+            let phys = self.next();
+            self.map(pml4_address, phys, vaddr as u64);
+            phys as usize
+        })
+    }
+
+    fn pml4_as_ref<'a>(&'a self, pml4_address: usize) -> &'a PML4 {
+        assert!(pml4_address % 4096 == 0);
+            let (pre, pml4, post): (_, &[_], _) = unsafe { self.backing[(pml4_address..pml4_address + 4096)].align_to() };
+            assert_eq!(pre.len(), 0);
+            assert_eq!(post.len(), 0);
+            &pml4[0]
+    }
+
     fn pml4_as_mut<'a>(&'a mut self, pml4_address: usize) -> &'a mut PML4 {
+        assert!(pml4_address % 4096 == 0);
             let (pre, pml4, post): (_, &mut [_], _) = unsafe { self.backing[(pml4_address..pml4_address + 4096)].align_to_mut() };
             assert_eq!(pre.len(), 0);
             assert_eq!(post.len(), 0);
             &mut pml4[0]
     }
 
+    fn pdpt_as_ref<'a>(&'a self, pdpt_address: usize) -> &'a PDPT {
+        assert!(pdpt_address % 4096 == 0);
+            let (pre, pt, post) = unsafe { self.backing[(pdpt_address..pdpt_address + 4096)].align_to() };
+            assert_eq!(pre.len(), 0);
+            assert_eq!(post.len(), 0);
+            &pt[0]
+    }
+
     fn pdpt_as_mut<'a>(&'a mut self, pdpt_address: usize) -> &'a mut PDPT {
+        assert!(pdpt_address % 4096 == 0);
             let (pre, pt, post) = unsafe { self.backing[(pdpt_address..pdpt_address + 4096)].align_to_mut() };
             assert_eq!(pre.len(), 0);
             assert_eq!(post.len(), 0);
             &mut pt[0]
     }
 
+    fn pd_as_ref<'a>(&'a self, pd_address: usize) -> &'a PD {
+        assert!(pd_address % 4096 == 0);
+            let (pre, pt, post) = unsafe { self.backing[(pd_address..pd_address + 4096)].align_to() };
+            assert_eq!(pre.len(), 0);
+            assert_eq!(post.len(), 0);
+            &pt[0]
+    }
+
     fn pd_as_mut<'a>(&'a mut self, pd_address: usize) -> &'a mut PD {
+        assert!(pd_address % 4096 == 0);
             let (pre, pt, post) = unsafe { self.backing[(pd_address..pd_address + 4096)].align_to_mut() };
             assert_eq!(pre.len(), 0);
             assert_eq!(post.len(), 0);
             &mut pt[0]
     }
 
+    fn pt_as_ref<'a>(&'a self, pt_address: usize) -> &'a PT {
+        assert!(pt_address % 4096 == 0);
+            let (pre, pt, post) = unsafe { self.backing[(pt_address..pt_address + 4096)].align_to() };
+            assert_eq!(pre.len(), 0);
+            assert_eq!(post.len(), 0);
+            &pt[0]
+    }
+
     fn pt_as_mut<'a>(&'a mut self, pt_address: usize) -> &'a mut PT {
+        assert!(pt_address % 4096 == 0);
             let (pre, pt, post) = unsafe { self.backing[(pt_address..pt_address + 4096)].align_to_mut() };
             assert_eq!(pre.len(), 0);
             assert_eq!(post.len(), 0);
             &mut pt[0]
     }
 
-    /// Map the given pages, returning the addresses of the new pages allocated
-    fn map_multiple(&mut self, pml4: usize, pages: &[u64], mut vaddr: u64) -> Vec<u64> {
+    /// Map the given pages, returning the addresses of the new page tables allocated
+    fn map_multiple(&mut self, pml4: usize, pages: &[u64], vaddr: u64) -> Vec<u64> {
         let mut pt_pages = vec![];
         for (i, page) in pages.iter().enumerate() {
-            pt_pages.append(&mut self.map(pml4, page * 4096, vaddr + i as u64 * 4096))
+            pt_pages.append(&mut self.map(pml4, page * 4096, vaddr + i as u64 * 4096));
         }
         pt_pages
     }
 
-    /// Map the given virtual address to the given physical address
-    fn map(&mut self, pml4_addr: usize, phys_address: u64, virt_address: u64) -> Vec<u64> {
+    /// Map the given virtual address to the given physical address, returning the addresses of the
+    /// page tables allocated
+    pub fn map(&mut self, pml4_addr: usize, phys_address: u64, virt_address: u64) -> Vec<u64> {
         assert_eq!(phys_address % 4096, 0, "physical address must be a multiple of 4096");
         assert_eq!(virt_address % 4096, 0, "virtual address must be a multiple of 4096");
         assert_eq!(pml4_addr % 4096, 0, "pml4 address must be a multiple of 4096");
+        println!("Mapping {:x} to {:x} in table at {:x}", virt_address, phys_address, pml4_addr);
 
         let mut pt_pages = vec![];
 
@@ -263,14 +381,14 @@ impl MemAlloc {
 
                 pt_pages.push(pt_frame_num);
                 self.next();
-                next = self.peek();
+                // next = self.peek();
                 pt_frame
             }
         };
         // END BIG BRAIN
 
         let pt = self.pt_as_mut(pt_frame);
-        dbg!(phys_address);
+        //dbg!(phys_address);
         pt[pt_index(VAddr::from_u64(virt_address))] = PTEntry::new(phys_address.into(), PTFlags::P | PTFlags::RW);
 
         pt_pages
@@ -279,7 +397,7 @@ impl MemAlloc {
 
 /// A VM along with the memory used to back it
 pub struct VM {
-    mem: MmapMut,
+    _mem: MmapMut,
     vmfd: VmFd,
     next_vcpu_id: u8
 }
@@ -300,7 +418,7 @@ impl VM {
         };
         unsafe { vm.set_user_memory_region(mem_region).unwrap() };
         Self {
-            mem: mem,
+            _mem: mem,
             vmfd: vm,
             next_vcpu_id: 0
         }
@@ -364,7 +482,7 @@ impl VMCore {
                 }
                 exit_reason => {
                     println!("Unexpected exit reason: {:?}", exit_reason);
-                    dbg!(self.vcpu.get_sregs());
+                    //dbg!(self.vcpu.get_sregs().unwrap());
                     break;
                 }
             }
