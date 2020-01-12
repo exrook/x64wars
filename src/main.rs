@@ -4,6 +4,7 @@ use std::fs::File;
 use std::io::Read;
 
 use goblin::elf::Elf;
+use goblin::elf::program_header::PT_LOAD;
 
 use kvm_ioctls::{Kvm, VmFd, VcpuFd, VcpuExit};
 use memmap::{MmapOptions,MmapMut};
@@ -21,7 +22,7 @@ fn main() {
 
     let elf1 = Elf::parse(&file1).unwrap();
 
-    //println!("{:#?}", elf1);
+    println!("{:#?}", elf1);
 
     let mut file2 = vec!();
     File::open("core2").unwrap().read_to_end(&mut file2).unwrap();
@@ -46,10 +47,34 @@ fn main() {
     //}
 
     let cr3 = mem.create_pml4() * 4096;
-    mem.load(cr3 as usize, &x86_code, 0x1000);
+    for h in elf1.program_headers {
+        if h.p_type != PT_LOAD {
+            continue
+        }
+        let code = &file1[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
+        mem.load2(cr3 as usize, code, h.p_vaddr as usize);
+    }
+    let entry = elf1.header.e_entry;
+    let stack = 0x00007FFFFFFFFFFF;
+    mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096)) as usize);
+    println!("e: {:x}", entry);
+    mem.identity_map(cr3 as usize, 0xFFFF800000000000);
+    //mem.load2(cr3 as usize, &x86_code, 0x1000);
 
     let cr3_2 = mem.create_pml4() * 4096;
-    mem.load(cr3_2 as usize, &x86_code_2, 0x1000);
+    for h in elf2.program_headers {
+        if h.p_type != PT_LOAD {
+            continue
+        }
+        let code = &file2[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
+        mem.load2(cr3_2 as usize, code, h.p_vaddr as usize);
+    }
+    let entry2 = elf2.header.e_entry;
+    let stack2 = 0x00007FFFFFFFFFFF;
+    mem.lookup_or_allocate(cr3_2 as usize, (stack2 - (stack2 % 4096)) as usize);
+    println!("e2: {:x}", entry2);
+    mem.identity_map(cr3_2 as usize, 0xFFFF800000000000);
+    //mem.load2(cr3_2 as usize, &x86_code_2, 0x1000);
 
     let mut vm = VM::new(mem.consume());
     let core1 = vm.new_core();
@@ -59,11 +84,11 @@ fn main() {
     let b1 = barrier.clone();
     let h1 = thread::spawn(move ||{
         barrier.wait();
-        core1.run64bit(0x1000, cr3)
+        core1.run64bit(entry, cr3, stack)
     });
     let h2 = thread::spawn(move ||{
         b1.wait();
-        core2.run64bit(0x1000, cr3_2)
+        core2.run64bit(entry2, cr3_2, stack2)
     });
     h1.join().unwrap();
     h2.join().unwrap();
@@ -112,10 +137,17 @@ impl MemAlloc {
         //let (pml4, _pt_pages) = self.create_map(&pages, vaddr);
         let mut pt_pages = self.map_multiple(pml4_address, &pages, vaddr);
 
-        for i in 0..(self.backing.len() / 4096) {
-            self.map(pml4_address, i as u64 * 4096, 0xFFFF800000000000 + (i as u64 * 4096));
-        }
+        self.identity_map(pml4_address, 0xFFFF800000000000);
+        //for i in 0..(self.backing.len() / 4096) {
+        //    self.map(pml4_address, i as u64 * 4096, 0xFFFF800000000000 + (i as u64 * 4096));
+        //}
         pml4_address as u64
+    }
+
+    pub fn identity_map(&mut self, pml4_address: usize, identity_base: u64) {
+        for i in 0..(self.backing.len() / 4096) {
+            self.map(pml4_address, i as u64 * 4096, identity_base + (i as u64 * 4096));
+        }
     }
 
     /// Copy `code` to the location `base_vaddr` address in the `pml4_address` address space,
@@ -123,7 +155,7 @@ impl MemAlloc {
     pub fn load2(&mut self, pml4_address: usize, code: &[u8], base_vaddr: usize) {
         let mut i = base_vaddr as usize;
         let section_end = base_vaddr as usize + code.len() - 1;
-        loop {
+        while i < (section_end + 1) {
             let chunk_start = i;
             let page_addr = (chunk_start / 4096)*4096;
             let chunk_end = section_end.min(page_addr + 4095);
@@ -134,7 +166,11 @@ impl MemAlloc {
             let frame_end_offset = chunk_end % 4096;
 
             let dest_slice = &mut self.get_frame_mut(backing_frame)[frame_start_offset..(frame_end_offset + 1)];
-            let src_slice = &code[(chunk_start - base_vaddr)..(chunk_end - base_vaddr)];
+            let src_slice = &code[(chunk_start - base_vaddr)..(chunk_end - base_vaddr + 1)];
+            println!("dest ptr: {:p} len: {}", dest_slice.as_ptr(), dest_slice.len());
+            //println!("dest {:x?}", dest_slice);
+            println!("src ptr: {:p} len: {}", src_slice.as_ptr(), src_slice.len());
+            //println!("src {:x?}", src_slice);
             dest_slice.copy_from_slice(src_slice);
 
             i = chunk_end + 1;
@@ -207,24 +243,24 @@ impl MemAlloc {
         }
     }
 
-    fn lookup_page(&self, pml4_address: usize, vaddr: usize) -> Option<&[u8]> {
+    pub fn lookup_page(&self, pml4_address: usize, vaddr: usize) -> Option<&[u8]> {
         self.lookup(pml4_address, vaddr).map(|p|&self.backing[p..(p + 4096)])
     }
 
-    fn get_frame(&self, frame_addr: usize) -> &[u8] {
+    pub fn get_frame(&self, frame_addr: usize) -> &[u8] {
         assert!(frame_addr % 4096 == 0);
         &self.backing[frame_addr..(frame_addr + 4096)]
     }
 
-    fn get_frame_mut(&mut self, frame_addr: usize) -> &mut [u8] {
+    pub fn get_frame_mut(&mut self, frame_addr: usize) -> &mut [u8] {
         assert!(frame_addr % 4096 == 0);
         &mut self.backing[frame_addr..(frame_addr + 4096)]
     }
 
     /// Lookup the frame for an address or allocate one
-    fn lookup_or_allocate(&mut self, pml4_address: usize, vaddr: usize) -> usize {
+    pub fn lookup_or_allocate(&mut self, pml4_address: usize, vaddr: usize) -> usize {
         self.lookup(pml4_address, vaddr).unwrap_or_else(||{
-            let phys = self.next();
+            let phys = self.next() * 4096;
             self.map(pml4_address, phys, vaddr as u64);
             phys as usize
         })
@@ -465,13 +501,14 @@ impl VMCore {
     }
 
     /// Run some 64 bit mode idgaf
-    pub fn run64bit(&self, entry: u64, cr3: u64) {
+    pub fn run64bit(&self, entry: u64, cr3: u64, stack: u64) {
         let mut vcpu_sregs = self.vcpu.get_sregs().unwrap();
         vcpu_sregs.cr3 = cr3; // TODO: point at page tables
         self.vcpu.set_sregs(&vcpu_sregs).unwrap();
 
         let mut vcpu_regs = self.vcpu.get_regs().unwrap();
         vcpu_regs.rip = entry;
+        vcpu_regs.rsp = stack;
         self.vcpu.set_regs(&vcpu_regs).unwrap();
 
         loop {
