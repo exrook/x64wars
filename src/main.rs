@@ -20,81 +20,88 @@ fn main() {
     let mut file1 = vec!();
     File::open("core1").unwrap().read_to_end(&mut file1).unwrap();
 
-    let elf1 = Elf::parse(&file1).unwrap();
+    //let elf1 = Elf::parse(&file1).unwrap();
 
-    println!("{:#?}", elf1);
+    //println!("{:#?}", elf1);
 
     let mut file2 = vec!();
     File::open("core2").unwrap().read_to_end(&mut file2).unwrap();
 
-    let elf2 = Elf::parse(&file2).unwrap();
+    //let elf2 = Elf::parse(&file2).unwrap();
 
-    //println!("{:#?}", elf2);
+    ////println!("{:#?}", elf2);
 
-    let x86_code = [
-        0xb8, 0x40, 0x00, 0x00, 0x00, /* mov rax, 64 */
-        0xf4,             /* hlt */
-    ];
+    let mut arena = Arena::new(mem);
+    arena.load(&file1);
+    arena.load(&file2);
+    arena.run();
 
-    let x86_code_2 = [
-        0xb8, 0x80, 0x00, 0x00, 0x00, /* mov rax, 128 */
-        0xf4,             /* hlt */
-    ];
+    //let x86_code = [
+    //    0xb8, 0x40, 0x00, 0x00, 0x00, /* mov rax, 64 */
+    //    0xf4,             /* hlt */
+    //];
 
-    //// copy code into vm memory
-    //for (i, x) in x86_code.iter().enumerate() {
-    //    mem[i] = *x
+    //let x86_code_2 = [
+    //    0xb8, 0x80, 0x00, 0x00, 0x00, /* mov rax, 128 */
+    //    0xf4,             /* hlt */
+    //];
+
+    ////// copy code into vm memory
+    ////for (i, x) in x86_code.iter().enumerate() {
+    ////    mem[i] = *x
+    ////}
+
+    //let cr3 = mem.create_pml4() * 4096;
+    //for h in elf1.program_headers {
+    //    if h.p_type != PT_LOAD {
+    //        continue
+    //    }
+    //    let code = &file1[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
+    //    mem.load2(cr3 as usize, code, h.p_vaddr as usize);
     //}
+    //let entry = elf1.header.e_entry;
+    //let stack: u64 = 0x00007FFFFFFFEFFF;
+    //mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096)) as usize);
+    //mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096) - 4096) as usize);
+    //println!("e: {:x}", entry);
+    //mem.identity_map(cr3 as usize, 0xFFFF800000000000);
+    ////mem.load2(cr3 as usize, &x86_code, 0x1000);
 
-    let cr3 = mem.create_pml4() * 4096;
-    for h in elf1.program_headers {
-        if h.p_type != PT_LOAD {
-            continue
-        }
-        let code = &file1[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
-        mem.load2(cr3 as usize, code, h.p_vaddr as usize);
-    }
-    let entry = elf1.header.e_entry;
-    let stack = 0x00007FFFFFFFFFFF;
-    mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096)) as usize);
-    println!("e: {:x}", entry);
-    mem.identity_map(cr3 as usize, 0xFFFF800000000000);
-    //mem.load2(cr3 as usize, &x86_code, 0x1000);
-
-    let cr3_2 = mem.create_pml4() * 4096;
-    for h in elf2.program_headers {
-        if h.p_type != PT_LOAD {
-            continue
-        }
-        let code = &file2[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
-        mem.load2(cr3_2 as usize, code, h.p_vaddr as usize);
-    }
-    let entry2 = elf2.header.e_entry;
-    let stack2 = 0x00007FFFFFFFFFFF;
-    mem.lookup_or_allocate(cr3_2 as usize, (stack2 - (stack2 % 4096)) as usize);
-    println!("e2: {:x}", entry2);
-    mem.identity_map(cr3_2 as usize, 0xFFFF800000000000);
+    //let cr3_2 = mem.create_pml4() * 4096;
+    //for h in elf2.program_headers {
+    //    if h.p_type != PT_LOAD {
+    //        continue
+    //    }
+    //    let code = &file2[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
+    //    mem.load2(cr3_2 as usize, code, h.p_vaddr as usize);
+    //}
+    //let entry2 = elf2.header.e_entry;
+    //let stack2: u64 = 0x00007FFFFFFFEFFF;
+    //mem.lookup_or_allocate(cr3_2 as usize, (stack2 - (stack2 % 4096)) as usize);
+    //mem.lookup_or_allocate(cr3_2 as usize, (stack2 - (stack2 % 4096) - 4096) as usize);
+    //println!("e2: {:x}", entry2);
+    //mem.identity_map(cr3_2 as usize, 0xFFFF800000000000);
     //mem.load2(cr3_2 as usize, &x86_code_2, 0x1000);
 
-    let mut vm = VM::new(mem.consume());
-    let core1 = vm.new_core();
-    let core2 = vm.new_core();
+    //let mut vm = Vm::new(mem);
+    //let core1 = vm.new_core();
+    //let core2 = vm.new_core();
 
-    let barrier = Arc::new(Barrier::new(2));
-    let b1 = barrier.clone();
-    let h1 = thread::spawn(move ||{
-        barrier.wait();
-        core1.run64bit(entry, cr3, stack)
-    });
-    let h2 = thread::spawn(move ||{
-        b1.wait();
-        core2.run64bit(entry2, cr3_2, stack2)
-    });
-    h1.join().unwrap();
-    h2.join().unwrap();
-    //run64bit(mem.consume(), 0x1000, cr3);
+    //let barrier = Arc::new(Barrier::new(2));
+    //let b1 = barrier.clone();
+    //let h1 = thread::spawn(move ||{
+    //    barrier.wait();
+    //    core1.run64bit(entry, cr3, stack)
+    //});
+    //let h2 = thread::spawn(move ||{
+    //    b1.wait();
+    //    core2.run64bit(entry2, cr3_2, stack2)
+    //});
+    //h1.join().unwrap();
+    //h2.join().unwrap();
+    ////run64bit(mem.consume(), 0x1000, cr3);
 
-    println!("Hello, world!");
+    //println!("Hello, world!");
 }
 
 /// A memory backing for our VM
@@ -431,18 +438,33 @@ impl MemAlloc {
     }
 }
 
-/// A VM along with the memory used to back it
-pub struct VM {
-    _mem: MmapMut,
-    vmfd: VmFd,
-    next_vcpu_id: u8
+#[repr(C,align(4096))]
+struct Exclusive ([u8; 4096]);
+
+impl Exclusive {
+    fn new() -> Self {
+        Self([0; 4096])
+    }
 }
 
-impl VM {
-    /// Make a new VM using the given memory
-    pub fn new(mut mem: MmapMut) -> Self {
-        let kvm = Kvm::new().unwrap();
+impl std::fmt::Debug for Exclusive {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        Ok(())
+    }
+}
 
+struct Program {
+    vm: VmFd,
+    cores: Vec<VMCore>,
+    entry: u64,
+    cr3: u64,
+    stack: u64,
+    exclusive: Box<Exclusive>
+}
+
+impl Program {
+    /// Make a new VM using the given memory
+    pub fn new(kvm: &Kvm, mem: &mut MmapMut, entry: u64, cr3: u64, stack: u64) -> Self {
         let vm = kvm.create_vm().unwrap();
 
         let mem_region = kvm_bindings::kvm_userspace_memory_region {
@@ -453,17 +475,128 @@ impl VM {
             flags: 0
         };
         unsafe { vm.set_user_memory_region(mem_region).unwrap() };
+
+        let mut exclusive = Box::from(Exclusive::new());
+
+        let exclusive_region = kvm_bindings::kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: mem.len() as u64,
+            memory_size: 4096,
+            userspace_addr: (&mut exclusive.0[0] as *mut u8) as u64,
+            flags: 0
+        };
+        unsafe { vm.set_user_memory_region(exclusive_region).unwrap() };
+
         Self {
-            _mem: mem,
-            vmfd: vm,
-            next_vcpu_id: 0
+            vm,
+            cores: vec![],
+            entry,
+            cr3,
+            stack,
+            exclusive
         }
     }
+
+    pub fn core_count(&self) -> u8 {
+        self.cores.len() as u8
+    }
+
     /// Create a new core for our VM
-    pub fn new_core(&mut self) -> VMCore {
-        let c = VMCore::new(self.vmfd.create_vcpu(self.next_vcpu_id).unwrap());
-        self.next_vcpu_id += 1;
-        c
+    pub fn new_core(&mut self) -> u8 {
+        let id = self.cores.len() as u8;
+        let c = VMCore::new(self.vm.create_vcpu(id).unwrap());
+        c.load_registers(self.entry, self.cr3, self.stack);
+        self.cores.push(c);
+        id
+    }
+
+    pub fn run_core(&self, core_id: u8) -> Result<VcpuExit, ()> {
+        self.cores[core_id as usize].run()
+    }
+}
+
+struct Arena {
+    mem: MemAlloc,
+    kvm: Kvm,
+    programs: Vec<Program>
+}
+
+impl Arena {
+    pub fn new(mem: MemAlloc) -> Self {
+        Self {
+            mem,
+            kvm: Kvm::new().unwrap(),
+            programs: vec![],
+        }
+    }
+
+    /// Executable is a byte slice cotaining a valid x86-64 elf executable
+    pub fn load(&mut self, executable: &[u8]) {
+        //let mut file1 = vec!();
+        //File::open("core1").unwrap().read_to_end(&mut file1).unwrap();
+
+        let elf = Elf::parse(&executable).unwrap();
+
+        //println!("{:#?}", elf);
+
+        let cr3 = self.mem.create_pml4() * 4096;
+        for h in elf.program_headers {
+            if h.p_type != PT_LOAD {
+                continue
+            }
+            let code = &executable[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
+            self.mem.load2(cr3 as usize, code, h.p_vaddr as usize);
+        }
+        let entry = elf.header.e_entry;
+        let stack = 0x00007FFFFFFFEFFF;
+        self.mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096)) as usize);
+        self.mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096) - 4096) as usize);
+        println!("e: {:x}", entry);
+        self.mem.identity_map(cr3 as usize, 0xFFFF800000000000);
+
+        let mut prog = Program::new(&self.kvm, &mut self.mem.backing, entry, cr3, stack);
+        prog.new_core();
+        self.programs.push(prog)
+    }
+
+    /// Run all programs
+    pub fn run(&mut self) {
+        //let core1 = vm.new_core();
+        //let core2 = vm.new_core();
+
+        let num_cores = self.programs.iter().map(|p|p.core_count() as usize).sum();
+        let barrier = Arc::new(Barrier::new(num_cores));
+        crossbeam::scope(|scope| {
+            self.programs.iter().flat_map( |p|{
+                let b2 = barrier.clone();
+                println!("{:?}", p.cores.len());
+                        println!("help me");
+                (0..p.core_count()).map( move |i|{
+                    let b = b2.clone();
+                    let i = i;
+                    scope.spawn(move |_|{
+                        println!("help 1");
+                        b.wait();
+                        println!("help 2");
+                        println!("{:?}", p.run_core(i));
+                    })
+                })
+            }).for_each(|h| {
+                
+            });
+        });
+        //let b1 = barrier.clone();
+        //let h1 = thread::spawn(move ||{
+        //    barrier.wait();
+        //    core1.run64bit(entry, cr3, stack)
+        //});
+        //let h2 = thread::spawn(move ||{
+        //    b1.wait();
+        //    core2.run64bit(entry2, cr3_2, stack2)
+        //});
+        //h1.join().unwrap();
+        //h2.join().unwrap();
+        ////run64bit(mem.consume(), 0x1000, cr3);
     }
 }
 
@@ -500,19 +633,23 @@ impl VMCore {
         }
     }
 
-    /// Run some 64 bit mode idgaf
-    pub fn run64bit(&self, entry: u64, cr3: u64, stack: u64) {
+    pub fn load_registers(&self, entry: u64, cr3: u64, stack: u64) {
         let mut vcpu_sregs = self.vcpu.get_sregs().unwrap();
-        vcpu_sregs.cr3 = cr3; // TODO: point at page tables
+        vcpu_sregs.cr3 = cr3;
         self.vcpu.set_sregs(&vcpu_sregs).unwrap();
 
         let mut vcpu_regs = self.vcpu.get_regs().unwrap();
         vcpu_regs.rip = entry;
         vcpu_regs.rsp = stack;
         self.vcpu.set_regs(&vcpu_regs).unwrap();
+    }
+
+    /// Run some 64 bit mode idgaf
+    pub fn run64bit(&self, entry: u64, cr3: u64, stack: u64) {
+        self.load_registers(entry, cr3, stack);
 
         loop {
-            match self.vcpu.run().expect("run failed") {
+            match self.run().expect("run failed") {
                 VcpuExit::Hlt => {
                     println!("Halt");
                     break;
@@ -527,5 +664,8 @@ impl VMCore {
 
         let vcpu_regs = self.vcpu.get_regs().unwrap();
         println!("{:?}", vcpu_regs);
+    }
+    pub fn run(&self) -> Result<VcpuExit, ()> {
+        self.vcpu.run().map_err(|_|())
     }
 }
