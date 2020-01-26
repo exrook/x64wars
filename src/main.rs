@@ -14,96 +14,42 @@ use rand::seq::SliceRandom;
 use rand::thread_rng;
 use x86::bits64::paging::*;
 
+use clap::{App,Arg};
+
 fn main() {
 
-    let mem_size = 0x400000;
+    let matches = App::new("x64 Wars")
+        .version("0.1")
+        .arg(Arg::with_name("program")
+            .index(1)
+            .multiple(true)
+            .required(true)
+        )
+        .arg(Arg::with_name("mem_size")
+            .short("m")
+            .takes_value(true)
+            .default_value("0x400000")
+        ).get_matches();
+
+    let programs = matches.values_of_os("program").unwrap();
+
+    let mem_size = usize::from_str_radix((matches.value_of("mem_size").unwrap().trim_start_matches("0x")), 16).expect("Unable to parse mem_size");
+    if mem_size % 4096 != 0 {
+        println!("mem_size must be a multiple of 4096");
+        return
+    }
     let mem = MemAlloc::new(mem_size);
 
-    let mut file1 = vec!();
-    File::open("core1").unwrap().read_to_end(&mut file1).unwrap();
-
-    //let elf1 = Elf::parse(&file1).unwrap();
-
-    //println!("{:#?}", elf1);
-
-    let mut file2 = vec!();
-    File::open("core2").unwrap().read_to_end(&mut file2).unwrap();
-
-    //let elf2 = Elf::parse(&file2).unwrap();
-
-    ////println!("{:#?}", elf2);
-
     let mut arena = Arena::new(mem);
-    arena.load(&file1);
-    arena.load(&file2);
+
+    for p in programs {
+        let mut file = vec!();
+        File::open(p).unwrap().read_to_end(&mut file).unwrap();
+        arena.load(&file);
+    }
+
     arena.run();
 
-    //let x86_code = [
-    //    0xb8, 0x40, 0x00, 0x00, 0x00, /* mov rax, 64 */
-    //    0xf4,             /* hlt */
-    //];
-
-    //let x86_code_2 = [
-    //    0xb8, 0x80, 0x00, 0x00, 0x00, /* mov rax, 128 */
-    //    0xf4,             /* hlt */
-    //];
-
-    ////// copy code into vm memory
-    ////for (i, x) in x86_code.iter().enumerate() {
-    ////    mem[i] = *x
-    ////}
-
-    //let cr3 = mem.create_pml4() * 4096;
-    //for h in elf1.program_headers {
-    //    if h.p_type != PT_LOAD {
-    //        continue
-    //    }
-    //    let code = &file1[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
-    //    mem.load2(cr3 as usize, code, h.p_vaddr as usize);
-    //}
-    //let entry = elf1.header.e_entry;
-    //let stack: u64 = 0x00007FFFFFFFEFFF;
-    //mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096)) as usize);
-    //mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096) - 4096) as usize);
-    //println!("e: {:x}", entry);
-    //mem.identity_map(cr3 as usize, 0xFFFF800000000000);
-    ////mem.load2(cr3 as usize, &x86_code, 0x1000);
-
-    //let cr3_2 = mem.create_pml4() * 4096;
-    //for h in elf2.program_headers {
-    //    if h.p_type != PT_LOAD {
-    //        continue
-    //    }
-    //    let code = &file2[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)];
-    //    mem.load2(cr3_2 as usize, code, h.p_vaddr as usize);
-    //}
-    //let entry2 = elf2.header.e_entry;
-    //let stack2: u64 = 0x00007FFFFFFFEFFF;
-    //mem.lookup_or_allocate(cr3_2 as usize, (stack2 - (stack2 % 4096)) as usize);
-    //mem.lookup_or_allocate(cr3_2 as usize, (stack2 - (stack2 % 4096) - 4096) as usize);
-    //println!("e2: {:x}", entry2);
-    //mem.identity_map(cr3_2 as usize, 0xFFFF800000000000);
-    //mem.load2(cr3_2 as usize, &x86_code_2, 0x1000);
-
-    //let mut vm = Vm::new(mem);
-    //let core1 = vm.new_core();
-    //let core2 = vm.new_core();
-
-    //let barrier = Arc::new(Barrier::new(2));
-    //let b1 = barrier.clone();
-    //let h1 = thread::spawn(move ||{
-    //    barrier.wait();
-    //    core1.run64bit(entry, cr3, stack)
-    //});
-    //let h2 = thread::spawn(move ||{
-    //    b1.wait();
-    //    core2.run64bit(entry2, cr3_2, stack2)
-    //});
-    //h1.join().unwrap();
-    //h2.join().unwrap();
-    ////run64bit(mem.consume(), 0x1000, cr3);
-
-    //println!("Hello, world!");
 }
 
 /// A memory backing for our VM
@@ -123,34 +69,6 @@ impl MemAlloc {
             backing: MmapOptions::new().len(size).map_anon().unwrap(),
             free
         }
-    }
-
-    /// Load the provided code into memory, creating a page table with it allocated at the given
-    /// `vaddr`, returning the address of the top level page table
-    pub fn load(&mut self, pml4_address: usize, code: &[u8], vaddr: u64) -> u64 {
-        assert_eq!(vaddr % 4096, 0, "vaddr must be a multiple of 4096");
-        let mut pages = vec![];
-        let mut count = 0;
-        while count < code.len() {
-            let page_num = self.next();
-            let page = page_num as usize * 4096;
-            pages.push(page_num);
-
-            let stride = if code.len() - count >= 4096 { 4096 } else { code.len() - count };
-            let target = &mut self.backing[(page..page + stride)];
-            target.copy_from_slice(&code[count..count+stride]);
-
-            count += 4096
-        }
-
-        //let (pml4, _pt_pages) = self.create_map(&pages, vaddr);
-        let _pt_pages = self.map_multiple(pml4_address, &pages, vaddr);
-
-        self.identity_map(pml4_address, 0xFFFF800000000000);
-        //for i in 0..(self.backing.len() / 4096) {
-        //    self.map(pml4_address, i as u64 * 4096, 0xFFFF800000000000 + (i as u64 * 4096));
-        //}
-        pml4_address as u64
     }
 
     pub fn identity_map(&mut self, pml4_address: usize, identity_base: u64) {
@@ -176,9 +94,9 @@ impl MemAlloc {
 
             let dest_slice = &mut self.get_frame_mut(backing_frame)[frame_start_offset..(frame_end_offset + 1)];
             let src_slice = &code[(chunk_start - base_vaddr)..(chunk_end - base_vaddr + 1)];
-            println!("dest ptr: {:p} len: {}", dest_slice.as_ptr(), dest_slice.len());
+            //println!("dest ptr: {:p} len: {}", dest_slice.as_ptr(), dest_slice.len());
             //println!("dest {:x?}", dest_slice);
-            println!("src ptr: {:p} len: {}", src_slice.as_ptr(), src_slice.len());
+            //println!("src ptr: {:p} len: {}", src_slice.as_ptr(), src_slice.len());
             //println!("src {:x?}", src_slice);
             dest_slice.copy_from_slice(src_slice);
 
@@ -211,7 +129,7 @@ impl MemAlloc {
         let pml4_address = pml4_frame_num as usize * 4096;
         pages.push(pml4_frame_num);
 
-        println!("{:?}: {:?}", pml4_address , pml4_frame_num);
+        //println!("{:?}: {:?}", pml4_address , pml4_frame_num);
         let mut pt_pages = self.map_multiple(pml4_address, &pages, vaddr);
         pt_pages.push(pml4_frame_num);
 
@@ -275,6 +193,7 @@ impl MemAlloc {
         })
     }
 
+    // these methods are probably unnecesary, but they quarantine the unsafe
     fn pml4_as_ref<'a>(&'a self, pml4_address: usize) -> &'a PML4 {
         assert!(pml4_address % 4096 == 0);
             let (pre, pml4, post): (_, &[_], _) = unsafe { self.backing[(pml4_address..pml4_address + 4096)].align_to() };
@@ -354,7 +273,7 @@ impl MemAlloc {
         assert_eq!(phys_address % 4096, 0, "physical address must be a multiple of 4096");
         assert_eq!(virt_address % 4096, 0, "virtual address must be a multiple of 4096");
         assert_eq!(pml4_addr % 4096, 0, "pml4 address must be a multiple of 4096");
-        println!("Mapping {:x} to {:x} in table at {:x}", virt_address, phys_address, pml4_addr);
+        //println!("Mapping {:x} to {:x} in table at {:x}", virt_address, phys_address, pml4_addr);
 
         let mut pt_pages = vec![];
 
@@ -371,11 +290,11 @@ impl MemAlloc {
                 let pdpt_frame_num = next;
                 let pdpt_frame = next as usize * 4096;
                 pml4[pml4_index(VAddr::from_u64(virt_address))] = PML4Entry::new(pdpt_frame.into(), PML4Flags::P | PML4Flags::RW);
-                for (i, x) in pml4.iter().enumerate() {
-                    if x.is_present() {
-                        println!("{}: {:?}", i, x);
-                    }
-                }
+                // for (i, x) in pml4.iter().enumerate() {
+                //     if x.is_present() {
+                //         println!("{}: {:?}", i, x);
+                //     }
+                // }
                 let pdpt = self.pdpt_as_mut(pdpt_frame);
                 // initialize PDPT with all zeroes
                 std::mem::replace(pdpt,[PDPTEntry(0); 512]);
@@ -448,12 +367,6 @@ impl Exclusive {
         Self([0; 4096])
     }
 }
-
-//impl std::fmt::Debug for Exclusive {
-//    fn fmt(&self, fmt: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
-//        Ok(())
-//    }
-//}
 
 struct Program {
     vm: VmFd,
@@ -608,7 +521,6 @@ struct Arena {
 impl Arena {
     pub fn new(mem: MemAlloc) -> Self {
         let kvm = Kvm::new().unwrap();
-        println!("readonlymem: {:?}", kvm.check_extension(kvm_ioctls::Cap::ReadonlyMem));
         Self {
             mem,
             kvm,
@@ -618,12 +530,7 @@ impl Arena {
 
     /// Executable is a byte slice cotaining a valid x86-64 elf executable
     pub fn load(&mut self, executable: &[u8]) {
-        //let mut file1 = vec!();
-        //File::open("core1").unwrap().read_to_end(&mut file1).unwrap();
-
         let elf = Elf::parse(&executable).unwrap();
-
-        //println!("{:#?}", elf);
 
         let cr3 = self.mem.create_pml4() * 4096;
         for h in elf.program_headers {
@@ -641,7 +548,6 @@ impl Arena {
         for i in 0..10 {
             self.mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096) - (4096 * i)) as usize);
         }
-        println!("e: {:x}", entry);
         self.mem.identity_map(cr3 as usize, 0xFFFF800000000000);
 
         self.mem.map(cr3 as usize, self.mem.backing.len() as u64, 0x00007FFFFFFFE000);
@@ -653,24 +559,9 @@ impl Arena {
 
     /// Run all programs
     pub fn run(mut self) {
-        //let core1 = vm.new_core();
-        //let core2 = vm.new_core();
         thread::spawn(move || {
             self.run_threads()
         }).join();
-
-        //let b1 = barrier.clone();
-        //let h1 = thread::spawn(move ||{
-        //    barrier.wait();
-        //    core1.run64bit(entry, cr3, stack)
-        //});
-        //let h2 = thread::spawn(move ||{
-        //    b1.wait();
-        //    core2.run64bit(entry2, cr3_2, stack2)
-        //});
-        //h1.join().unwrap();
-        //h2.join().unwrap();
-        ////run64bit(mem.consume(), 0x1000, cr3);
     }
     fn run_threads(&mut self) {
 
@@ -679,23 +570,22 @@ impl Arena {
         let (send, recv) = channel::bounded::<HyperMessage>(num_cores);
 
         let barrier = Arc::new(Barrier::new(num_cores));
-        crossbeam::scope(move |scope| {
+        crossbeam::scope(|scope| {
             self.programs.iter().flat_map(|p| {
                 (0..p.core_count()).map( move |i|{
                     (p, i)
                 })
             }).for_each(|(p, i)| {
                 use std::os::unix::io::AsRawFd;
-                println!("{:?}: {:?}", p.vm.as_raw_fd(), i);
                 let s = send.clone();
                 let b = barrier.clone();
                 scope.spawn(move |_|{
-                    println!("help 1");
                     b.wait();
-                    println!("help 2");
-                    println!("{:?}", p.run_core(i, s));
+                    p.run_core(i, s)
                 });
             });
+            // This way the channel closes
+            drop(send);
             loop {
                 match recv.recv() {
                     Ok(HyperMessage::Print(s)) => {
@@ -724,7 +614,6 @@ impl VMCore {
     fn new(vcpu: VcpuFd) -> Self {
         let mut vcpu_sregs = vcpu.get_sregs().unwrap();
         vcpu_sregs.cr4 = 0b10100000;
-        //vcpu_sregs.cr3 = cr3; // We set cr3 later
         vcpu_sregs.efer |= 0x00000500; // If we don't set bit 4 we get big stinky error when we set_sregs
         vcpu_sregs.cr0 |= 0x80000001;
 
@@ -760,27 +649,6 @@ impl VMCore {
         self.vcpu.set_regs(&vcpu_regs).unwrap();
     }
 
-    /// Run some 64 bit mode idgaf
-    pub fn run64bit(&self, entry: u64, cr3: u64, stack: u64) {
-        self.load_registers(entry, cr3, stack, 0);
-
-        loop {
-            match self.run().expect("run failed") {
-                VcpuExit::Hlt => {
-                    println!("Halt");
-                    break;
-                }
-                exit_reason => {
-                    println!("Unexpected exit reason: {:?}", exit_reason);
-                    //dbg!(self.vcpu.get_sregs().unwrap());
-                    break;
-                }
-            }
-        }
-
-        let vcpu_regs = self.vcpu.get_regs().unwrap();
-        println!("{:?}", vcpu_regs);
-    }
     pub fn run(&self) -> Result<VcpuExit, ()> {
         self.vcpu.run().map_err(|_|())
     }
