@@ -29,11 +29,18 @@ fn main() {
             .short("m")
             .takes_value(true)
             .default_value("0x400000")
+        )
+        .arg(Arg::with_name("repeat")
+            .short("r")
+            .takes_value(true)
+            .default_value("1")
         ).get_matches();
 
     let programs = matches.values_of_os("program").unwrap();
 
     let mem_size = usize::from_str_radix((matches.value_of("mem_size").unwrap().trim_start_matches("0x")), 16).expect("Unable to parse mem_size");
+
+    let r: usize = str::parse(matches.value_of("repeat").unwrap()).expect("invalid r value");
     if mem_size % 4096 != 0 {
         println!("mem_size must be a multiple of 4096");
         return
@@ -43,9 +50,11 @@ fn main() {
     let mut arena = Arena::new(mem);
 
     for p in programs {
-        let mut file = vec!();
-        File::open(p).unwrap().read_to_end(&mut file).unwrap();
-        arena.load(&file);
+        for i in 0..r {
+            let mut file = vec!();
+            File::open(p).unwrap().read_to_end(&mut file).unwrap();
+            arena.load(&file);
+        }
     }
 
     arena.run();
@@ -465,7 +474,6 @@ impl Program {
             match self.cores[core_id as usize].run()? {
                 VcpuExit::Hlt => {
                     let mut regs = self.cores[core_id as usize].vcpu.get_regs().unwrap();
-                    println!("HALT: {:?}", regs.rax);
                     regs.rax = match regs.rax {
                         // Print Text
                         1 => {
@@ -487,12 +495,14 @@ impl Program {
                         }
                         // Submit value
                         2 => {
+                            println!("HALT: {:?}", regs.rax);
                             self.with_exclusive(|e| {
                                 e.0
                             });
                             0
                         }
                         _ => {
+                            println!("HALT: {:?}", regs.rax);
                             std::u64::MAX
                         }
                     };
@@ -545,7 +555,7 @@ impl Arena {
         }
         let entry = elf.header.e_entry;
         let stack = 0x00007FFFFFFFDFFF;
-        for i in 0..10 {
+        for i in 0..100 {
             self.mem.lookup_or_allocate(cr3 as usize, (stack - (stack % 4096) - (4096 * i)) as usize);
         }
         self.mem.identity_map(cr3 as usize, 0xFFFF800000000000);
@@ -589,7 +599,7 @@ impl Arena {
             loop {
                 match recv.recv() {
                     Ok(HyperMessage::Print(s)) => {
-                        println!("message: {:?}", s);
+                        print!("{}", s);
                     }
                     Err(e) => {
                         println!("{:?}", e);
