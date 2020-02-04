@@ -3,10 +3,11 @@ use std::io::Read;
 
 use clap::{App,Arg};
 
-use x64wars::{MemAlloc, Arena};
+use x64wars::{MemAlloc, Arena, ArenaCommand, ArenaMessage};
+
+use crossbeam::channel;
 
 fn main() {
-
     let matches = App::new("x64 Wars")
         .version("0.1")
         .arg(Arg::with_name("program")
@@ -19,6 +20,11 @@ fn main() {
             .takes_value(true)
             .default_value("0x400000")
         )
+        .arg(Arg::with_name("time")
+            .short("t")
+            .takes_value(true)
+            .help("How long to wait (in ms) for programs to finish, if not present wait forever")
+        )
         .arg(Arg::with_name("repeat")
             .short("r")
             .takes_value(true)
@@ -27,9 +33,10 @@ fn main() {
 
     let programs = matches.values_of_os("program").unwrap();
 
-    let mem_size = usize::from_str_radix((matches.value_of("mem_size").unwrap().trim_start_matches("0x")), 16).expect("Unable to parse mem_size");
+    let mem_size = usize::from_str_radix(matches.value_of("mem_size").unwrap().trim_start_matches("0x"), 16).expect("Unable to parse mem_size");
 
     let r: usize = str::parse(matches.value_of("repeat").unwrap()).expect("invalid r value");
+    let t: Option<u64> = matches.value_of("time").map(|s|str::parse(s).expect("invalid r value"));
     if mem_size % 4096 != 0 {
         println!("mem_size must be a multiple of 4096");
         return
@@ -38,13 +45,26 @@ fn main() {
 
     let mut arena = Arena::new(mem);
 
-    for p in programs {
+    println!("Loading {} programs", programs.len() * r);
+
+    for (pi, p) in programs.enumerate() {
         for i in 0..r {
             let mut file = vec!();
             File::open(p).unwrap().read_to_end(&mut file).unwrap();
             arena.load(&file);
+            println!("Loaded program #{}", pi * r + i);
         }
     }
 
-    arena.run();
+    println!("Programs loaded!");
+
+    let h = arena.run();
+
+    if let Some(t) = t {
+        std::thread::sleep(std::time::Duration::from_millis(t));
+        println!("kill confirmed");
+        h.send.send(ArenaCommand::Shutdown);
+    }
+
+    println!("{:?}", h.wait().unwrap());
 }

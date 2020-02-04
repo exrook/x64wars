@@ -1,16 +1,52 @@
-use std::thread;
+use std::thread::{self, LocalKey};
 use std::sync::{Arc,Barrier,Mutex};
+use std::os::unix::thread::{JoinHandleExt, RawPthread};
+use std::os::unix::io::AsRawFd;
+use std::io;
+use std::cell::Cell;
 
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
 
-use crossbeam::channel;
+use crossbeam::channel::{self, select};
 
+use vmm_sys_util::signal::{self, Killable};
 use kvm_ioctls::{Kvm, VmFd, VcpuFd, VcpuExit};
 use memmap::{MmapOptions,MmapMut};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use x86::bits64::paging::*;
+
+struct KillableThread<T> {
+    thread: T
+}
+
+unsafe impl<T: JoinHandleExt> Killable for KillableThread<T> {
+    fn pthread_handle(&self) -> RawPthread {
+        self.thread.as_pthread_t()
+    }
+}
+
+impl<T: JoinHandleExt> From<T> for KillableThread<T> {
+    fn from(thread: T) -> Self {
+        Self {
+            thread
+        }
+    }
+}
+
+impl<T> std::ops::Deref for KillableThread<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.thread
+    }
+}
+
+impl<T> std::ops::DerefMut for KillableThread<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.thread
+    }
+}
 
 /// A memory backing for our VM
 #[derive(Debug)]
@@ -25,6 +61,7 @@ impl MemAlloc {
         assert_eq!(size % 4096, 0, "size must be a multiple of 4096");
         let mut free: Vec<_> = (0..(size as u64/4096)).collect();
         free.shuffle(&mut thread_rng());
+        println!("frames: {}", free.len());
         Self {
             backing: MmapOptions::new().len(size).map_anon().unwrap(),
             free
@@ -39,7 +76,7 @@ impl MemAlloc {
 
     /// Copy `code` to the location `base_vaddr` address in the `pml4_address` address space,
     /// perserving existing mappings if present, creating new ones if not
-    pub fn load2(&mut self, pml4_address: usize, code: &[u8], base_vaddr: usize) {
+    pub fn load(&mut self, pml4_address: usize, code: &[u8], base_vaddr: usize) {
         let mut i = base_vaddr as usize;
         let section_end = base_vaddr as usize + code.len() - 1;
         while i < (section_end + 1) {
@@ -394,7 +431,7 @@ impl Program {
         };
 
         let res = unsafe { self.vm.set_user_memory_region(exclusive_region_immut) };
-        res.map_err(|e| std::io::Error::from_raw_os_error(e.errno())).unwrap();
+        res.unwrap();
 
         let ret = f(&mut exclusive);
 
@@ -420,10 +457,10 @@ impl Program {
         id
     }
 
-    pub fn run_core(&self, core_id: u8, chan: channel::Sender<HyperMessage>) -> Result<(), ()> {
+    pub fn run_core(&self, program_id: usize, core_id: u8, chan: &channel::Sender<HyperMessage>) -> io::Result<()> {
         loop {
-            match self.cores[core_id as usize].run()? {
-                VcpuExit::Hlt => {
+            match self.cores[core_id as usize].run() {
+                Ok(VcpuExit::Hlt) => {
                     let mut regs = self.cores[core_id as usize].vcpu.get_regs().unwrap();
                     regs.rax = match regs.rax {
                         // Print Text
@@ -435,7 +472,7 @@ impl Program {
                             let len = regs.rsi as usize;
                             if offset < mem.len() && (offset + len) < mem.len() {
                                 if let Ok(s) = std::str::from_utf8(&mem[offset..(offset + len)]) {
-                                    chan.send(HyperMessage::Print(s.to_owned()));
+                                    chan.send(HyperMessage::Print(s.to_owned())).unwrap();
                                     0
                                 } else {
                                     std::u64::MAX
@@ -459,16 +496,30 @@ impl Program {
                     };
                     self.cores[core_id as usize].vcpu.set_regs(&regs).unwrap();
                 }
-                VcpuExit::Shutdown => {
+                Ok(VcpuExit::Shutdown) => {
                     let regs = self.cores[core_id as usize].vcpu.get_regs().unwrap();
                     println!("Shutting down {:?}", regs);
                     break
                 }
-                e => {
+                Ok(e) => {
+                    println!("save me");
                     panic!("unexpected vcpu exit {:?}", e);
+                }
+                Err(e) => {
+                    match e.kind() {
+                        io::ErrorKind::Interrupted => {
+                            let regs = self.cores[core_id as usize].vcpu.get_regs().unwrap();
+                            println!("Commanded shut down {:?}", regs);
+                            break;
+                        }
+                        _ => {
+                            Err(e)?
+                        }
+                    }
                 }
             }
         }
+        let regs = self.cores[core_id as usize].vcpu.get_regs()?;
         Ok(())
     }
 }
@@ -490,8 +541,9 @@ impl Arena {
     }
 
     /// Executable is a byte slice cotaining a valid x86-64 elf executable
-    pub fn load(&mut self, executable: &[u8]) {
-        let elf = Elf::parse(&executable).unwrap();
+    pub fn load<B: AsRef<[u8]>>(&mut self, executable: B) -> usize {
+        let executable = executable.as_ref();
+        let elf = Elf::parse(&executable.as_ref()).unwrap();
 
         let cr3 = self.mem.create_pml4() * 4096;
         for h in elf.program_headers {
@@ -502,7 +554,7 @@ impl Arena {
             if h.p_filesz > 0 {
                 code.copy_from_slice(&executable[h.p_offset as usize..(h.p_offset as usize + h.p_filesz as usize)]);
             }
-            self.mem.load2(cr3 as usize, &code, h.p_vaddr as usize);
+            self.mem.load(cr3 as usize, &code, h.p_vaddr as usize);
         }
         let entry = elf.header.e_entry;
         let stack = 0x00007FFFFFFFDFFF;
@@ -515,55 +567,142 @@ impl Arena {
 
         let mut prog = Program::new(&self.kvm, &mut self.mem.backing, entry, cr3, stack);
         prog.new_core();
-        self.programs.push(prog)
+        let idx = self.programs.len();
+        self.programs.push(prog);
+        idx
     }
 
     /// Run all programs
-    pub fn run(mut self) {
-        thread::spawn(move || {
-            self.run_threads()
-        }).join();
+    pub fn run(mut self) -> ArenaHandle {
+        println!("E");
+        ArenaHandle::new(self)
     }
-    fn run_threads(&mut self) {
 
+    fn run_threads(&mut self, msend: channel::Sender<ArenaMessage>, crecv: channel::Receiver<ArenaCommand>) {
         let num_cores = self.programs.iter().map(|p|p.core_count() as usize).sum();
 
         let (send, recv) = channel::bounded::<HyperMessage>(num_cores);
 
         let barrier = Arc::new(Barrier::new(num_cores));
         crossbeam::scope(|scope| {
-            self.programs.iter().flat_map(|p| {
-                (0..p.core_count()).map( move |i|{
-                    (p, i)
+            let handles: Vec<_> = self.programs.iter().enumerate().flat_map(|(id, p)| {
+                (0..p.core_count()).map( move |tid|{
+                    (p, id, tid)
                 })
-            }).for_each(|(p, i)| {
-                use std::os::unix::io::AsRawFd;
+            }).map(|(p, id, tid)| {
                 let s = send.clone();
                 let b = barrier.clone();
-                scope.spawn(move |_|{
+                let handle: KillableThread<_> = scope.spawn(move |_|{
+                    thread_local!(static SIGNAL_VCPU_FD: std::cell::Cell<Option<&'static VcpuFd>> = None.into());
+                    extern "C" fn handle_signal(signo: std::os::raw::c_int, _: *mut libc::siginfo_t, _: *mut std::ffi::c_void) {
+                        SIGNAL_VCPU_FD.with(|vmfd_cell| {
+                            if let Some(vmfd) = vmfd_cell.take() {
+                                vmfd.set_kvm_immediate_exit(signo as u8);
+                                vmfd_cell.set(Some(vmfd));
+                            }
+                        })
+                    }
+                    // this is a stupid hack
+                    SIGNAL_VCPU_FD.with(|vmfd| {
+                        let bounded_ref: &VcpuFd = &p.cores[tid as usize].vcpu;
+                        let static_ref: &'static VcpuFd = unsafe { std::mem::transmute(bounded_ref) };
+                        vmfd.set(Some(static_ref))
+                    });
+                    signal::register_signal_handler(10, handle_signal);
                     b.wait();
-                    p.run_core(i, s)
-                });
-            });
-            // This way the channel closes
-            drop(send);
+                    p.run_core(id, tid, &s);
+                    SIGNAL_VCPU_FD.with(|vmfd| {
+                        vmfd.set(None)
+                    });
+                    s.send(HyperMessage::Shutdown(id, tid));
+                }).into();
+                handle
+            }).collect();
+
+            let mut deaths = vec![];
+
+            drop(send); // This way the channel closes
             loop {
-                match recv.recv() {
-                    Ok(HyperMessage::Print(s)) => {
-                        print!("{}", s);
-                    }
-                    Err(e) => {
-                        println!("{:?}", e);
-                        break
-                    }
+                select! { 
+                    recv(recv) -> msg => match msg {
+                            Ok(HyperMessage::Print(s)) => {
+                                print!("{}", s);
+                            }
+                            Ok(HyperMessage::Shutdown(id, tid)) => {
+                                println!("Shutdown of program {} core {}", id, tid);
+                                msend.send(ArenaMessage::Death(id, tid));
+                                deaths.push((id, tid));
+                            }
+                            Err(e) => {
+                                println!("HyperMessageError: {:?}", e);
+                                break
+                            }
+                        },
+                    recv(crecv) -> msg => match msg {
+                            Ok(ArenaCommand::Shutdown) => {
+                                println!("Shutdown commanded");
+                                for h in &handles {
+                                    h.kill(10);
+                                }
+                                //break;
+                            }
+                            Err(e) => {
+                                println!("ArenaCommandError: {:?}", e);
+                            }
+                        }
                 }
             }
+            println!("halp");
+            msend.send(ArenaMessage::Shutdown(deaths))
         }).unwrap();
     }
 }
 
+pub struct ArenaHandle {
+    pub send: channel::Sender<ArenaCommand>,
+    pub recv: channel::Receiver<ArenaMessage>,
+    handle: thread::JoinHandle<()>
+}
+
+impl ArenaHandle {
+    fn new(mut arena: Arena) -> Self {
+        let (msend, mrecv) = channel::bounded(16); // TODO: decide on a good limit here
+        let (csend, crecv) = channel::bounded(16);
+        Self {
+            send: csend,
+            recv: mrecv,
+            handle: 
+                thread::spawn(move || {
+                    arena.run_threads(msend, crecv)
+                })
+        }
+    }
+    pub fn join(self) -> Result<(), Box<dyn std::any::Any + Send>> {
+        self.handle.join()
+    }
+    pub fn wait(self) -> Result<Vec<(usize, u8)>,()> {
+        loop {
+            match self.recv.recv() {
+                Ok(ArenaMessage::Shutdown(d)) => return Ok(d),
+                Ok(ArenaMessage::Death(id, tid)) => println!("Death of program {} core {}", id, tid),
+                Err(e) => Err(())?
+            }
+        }
+    }
+}
+
+pub enum ArenaCommand {
+    Shutdown
+}
+
+pub enum ArenaMessage {
+    Death(usize, u8),
+    Shutdown(Vec<(usize, u8)>)
+}
+
 enum HyperMessage {
-    Print(String)
+    Print(String),
+    Shutdown(usize, u8)
 }
 
 /// One core of our virtual machine
@@ -610,7 +749,7 @@ impl VMCore {
         self.vcpu.set_regs(&vcpu_regs).unwrap();
     }
 
-    pub fn run(&self) -> Result<VcpuExit, ()> {
-        self.vcpu.run().map_err(|_|())
+    pub fn run(&self) -> io::Result<VcpuExit> {
+        self.vcpu.run()
     }
 }
