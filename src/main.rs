@@ -1,11 +1,10 @@
 use std::fs::File;
 use std::io::Read;
+use std::time::Duration;
 
 use clap::{App,Arg};
 
 use x64wars::{MemAlloc, Arena, ArenaCommand, ArenaMessage};
-
-use crossbeam::channel;
 
 fn main() {
     let matches = App::new("x64 Wars")
@@ -51,8 +50,8 @@ fn main() {
         for i in 0..r {
             let mut file = vec!();
             File::open(p).unwrap().read_to_end(&mut file).unwrap();
-            arena.load(&file);
-            println!("Loaded program #{}", pi * r + i);
+            let id = arena.load(&file);
+            println!("Loaded program {} copy {} with id: {}", pi, i, id);
         }
     }
 
@@ -60,11 +59,7 @@ fn main() {
 
     let h = arena.run();
 
-    if let Some(t) = t {
-        std::thread::sleep(std::time::Duration::from_millis(t));
-        println!("kill confirmed");
-        h.send.send(ArenaCommand::Shutdown);
-    }
+    let timeout = t.map(|t| Duration::from_millis(t));
 
-    println!("{:?}", h.wait().unwrap());
+    println!("{:?}", h.wait(timeout).unwrap().1.last());
 }

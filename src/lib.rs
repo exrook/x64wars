@@ -1,9 +1,8 @@
-use std::thread::{self, LocalKey};
+use std::thread;
 use std::sync::{Arc,Barrier,Mutex};
 use std::os::unix::thread::{JoinHandleExt, RawPthread};
-use std::os::unix::io::AsRawFd;
 use std::io;
-use std::cell::Cell;
+use std::time::{Instant, Duration};
 
 use goblin::elf::Elf;
 use goblin::elf::program_header::PT_LOAD;
@@ -16,6 +15,8 @@ use memmap::{MmapOptions,MmapMut};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use x86::bits64::paging::*;
+
+use scoped_signal::{SignalScope, SigSet, SaFlags, Signal, SigHandler};
 
 struct KillableThread<T> {
     thread: T
@@ -45,6 +46,24 @@ impl<T> std::ops::Deref for KillableThread<T> {
 impl<T> std::ops::DerefMut for KillableThread<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.thread
+    }
+}
+
+/// Press F
+#[derive(Debug, Clone)]
+pub struct Tombstone {
+    pub death_time: Instant,
+    pub program_id: usize,
+    pub thread_id: u8
+}
+
+impl Tombstone {
+    fn new(death_time: Instant, program_id: usize, thread_id: u8) -> Self {
+        Self {
+            death_time,
+            program_id,
+            thread_id
+        }
     }
 }
 
@@ -498,7 +517,7 @@ impl Program {
                 }
                 Ok(VcpuExit::Shutdown) => {
                     let regs = self.cores[core_id as usize].vcpu.get_regs().unwrap();
-                    println!("Shutting down {:?}", regs);
+                    //println!("Shutting down {:?}", regs);
                     break
                 }
                 Ok(e) => {
@@ -574,7 +593,6 @@ impl Arena {
 
     /// Run all programs
     pub fn run(mut self) -> ArenaHandle {
-        println!("E");
         ArenaHandle::new(self)
     }
 
@@ -583,7 +601,7 @@ impl Arena {
 
         let (send, recv) = channel::bounded::<HyperMessage>(num_cores);
 
-        let barrier = Arc::new(Barrier::new(num_cores));
+        let barrier = Arc::new(Barrier::new(num_cores + 1));
         crossbeam::scope(|scope| {
             let handles: Vec<_> = self.programs.iter().enumerate().flat_map(|(id, p)| {
                 (0..p.core_count()).map( move |tid|{
@@ -593,31 +611,25 @@ impl Arena {
                 let s = send.clone();
                 let b = barrier.clone();
                 let handle: KillableThread<_> = scope.spawn(move |_|{
-                    thread_local!(static SIGNAL_VCPU_FD: std::cell::Cell<Option<&'static VcpuFd>> = None.into());
-                    extern "C" fn handle_signal(signo: std::os::raw::c_int, _: *mut libc::siginfo_t, _: *mut std::ffi::c_void) {
-                        SIGNAL_VCPU_FD.with(|vmfd_cell| {
-                            if let Some(vmfd) = vmfd_cell.take() {
-                                vmfd.set_kvm_immediate_exit(signo as u8);
-                                vmfd_cell.set(Some(vmfd));
-                            }
-                        })
-                    }
-                    // this is a stupid hack
-                    SIGNAL_VCPU_FD.with(|vmfd| {
-                        let bounded_ref: &VcpuFd = &p.cores[tid as usize].vcpu;
-                        let static_ref: &'static VcpuFd = unsafe { std::mem::transmute(bounded_ref) };
-                        vmfd.set(Some(static_ref))
+                    let vcpufd = &p.cores[tid as usize].vcpu;
+                    let handler_fn = |signo, _info: &_| {
+                        vcpufd.set_kvm_immediate_exit(signo as u8);
+                    };
+                    let handler = unsafe { SignalScope::new(Signal::SIGUSR1, SaFlags::empty(), SigSet::empty(), handler_fn) };
+                    handler.run(|| {
+                        b.wait();
+                        p.run_core(id, tid, &s);
+                        let death_time = Instant::now();
+                        let tomb = Tombstone::new(death_time, id, tid);
+                        s.send(HyperMessage::Shutdown(tomb));
                     });
-                    signal::register_signal_handler(10, handle_signal);
-                    b.wait();
-                    p.run_core(id, tid, &s);
-                    SIGNAL_VCPU_FD.with(|vmfd| {
-                        vmfd.set(None)
-                    });
-                    s.send(HyperMessage::Shutdown(id, tid));
                 }).into();
                 handle
             }).collect();
+
+            let start = Instant::now();
+            barrier.wait();
+
 
             let mut deaths = vec![];
 
@@ -628,10 +640,9 @@ impl Arena {
                             Ok(HyperMessage::Print(s)) => {
                                 print!("{}", s);
                             }
-                            Ok(HyperMessage::Shutdown(id, tid)) => {
-                                println!("Shutdown of program {} core {}", id, tid);
-                                msend.send(ArenaMessage::Death(id, tid));
-                                deaths.push((id, tid));
+                            Ok(HyperMessage::Shutdown(tombstone)) => {
+                                msend.send(ArenaMessage::Death(tombstone.clone()));
+                                deaths.push(tombstone);
                             }
                             Err(e) => {
                                 println!("HyperMessageError: {:?}", e);
@@ -653,7 +664,7 @@ impl Arena {
                 }
             }
             println!("halp");
-            msend.send(ArenaMessage::Shutdown(deaths))
+            msend.send(ArenaMessage::Shutdown(start, deaths))
         }).unwrap();
     }
 }
@@ -680,12 +691,21 @@ impl ArenaHandle {
     pub fn join(self) -> Result<(), Box<dyn std::any::Any + Send>> {
         self.handle.join()
     }
-    pub fn wait(self) -> Result<Vec<(usize, u8)>,()> {
+    pub fn wait(self, timeout: Option<Duration>) -> Result<(Instant, Vec<Tombstone>),()> {
+        self.wait2(timeout, |_|())
+    }
+    pub fn wait2<F: FnMut(ArenaMessage)>(self, timeout: Option<Duration>, mut f: F) -> Result<(Instant, Vec<Tombstone>),()> {
+        let timeout = timeout.map(|d| channel::after(d)).unwrap_or(channel::never());
         loop {
-            match self.recv.recv() {
-                Ok(ArenaMessage::Shutdown(d)) => return Ok(d),
-                Ok(ArenaMessage::Death(id, tid)) => println!("Death of program {} core {}", id, tid),
-                Err(e) => Err(())?
+            select! {
+                recv(self.recv) -> msg => match msg {
+                        Ok(ArenaMessage::Shutdown(s, d)) => return Ok((s,d)),
+                        Ok(msg) => f(msg),
+                        Err(e) => Err(())?
+                    },
+                recv(timeout) -> _ => {
+                    self.send.send(ArenaCommand::Shutdown);
+                }
             }
         }
     }
@@ -696,13 +716,13 @@ pub enum ArenaCommand {
 }
 
 pub enum ArenaMessage {
-    Death(usize, u8),
-    Shutdown(Vec<(usize, u8)>)
+    Death(Tombstone),
+    Shutdown(Instant, Vec<Tombstone>)
 }
 
 enum HyperMessage {
     Print(String),
-    Shutdown(usize, u8)
+    Shutdown(Tombstone)
 }
 
 /// One core of our virtual machine
