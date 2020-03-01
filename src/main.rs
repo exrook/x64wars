@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use clap::{App,Arg};
 
-use x64wars::{MemAlloc, Arena, ArenaCommand, ArenaMessage};
+use x64wars::{mem::MemAlloc, Arena};
 
 fn main() {
     let matches = App::new("x64 Wars")
