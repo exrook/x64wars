@@ -54,15 +54,17 @@ impl<T> std::ops::DerefMut for KillableThread<T> {
 pub struct Tombstone {
     pub death_time: Instant,
     pub program_id: usize,
-    pub thread_id: u8
+    pub thread_id: u8,
+    pub forced: bool
 }
 
 impl Tombstone {
-    fn new(death_time: Instant, program_id: usize, thread_id: u8) -> Self {
+    fn new(death_time: Instant, program_id: usize, thread_id: u8, forced: bool) -> Self {
         Self {
             death_time,
             program_id,
-            thread_id
+            thread_id,
+            forced
         }
     }
 }
@@ -476,7 +478,7 @@ impl Program {
         id
     }
 
-    pub fn run_core(&self, program_id: usize, core_id: u8, chan: &channel::Sender<HyperMessage>) -> io::Result<()> {
+    pub fn run_core(&self, program_id: usize, core_id: u8, chan: &channel::Sender<HyperMessage>) -> io::Result<bool> {
         loop {
             match self.cores[core_id as usize].run() {
                 Ok(VcpuExit::Hlt) => {
@@ -529,7 +531,7 @@ impl Program {
                         io::ErrorKind::Interrupted => {
                             let regs = self.cores[core_id as usize].vcpu.get_regs().unwrap();
                             println!("Commanded shut down {:?}", regs);
-                            break;
+                            return Ok(true);
                         }
                         _ => {
                             Err(e)?
@@ -539,7 +541,7 @@ impl Program {
             }
         }
         let regs = self.cores[core_id as usize].vcpu.get_regs()?;
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -618,9 +620,9 @@ impl Arena {
                     let handler = unsafe { SignalScope::new(Signal::SIGUSR1, SaFlags::empty(), SigSet::empty(), handler_fn) };
                     handler.run(|| {
                         b.wait();
-                        p.run_core(id, tid, &s);
+                        let forced = p.run_core(id, tid, &s).unwrap_or(false);
                         let death_time = Instant::now();
-                        let tomb = Tombstone::new(death_time, id, tid);
+                        let tomb = Tombstone::new(death_time, id, tid, forced);
                         s.send(HyperMessage::Shutdown(tomb));
                     });
                 }).into();
@@ -701,6 +703,7 @@ impl ArenaHandle {
                 recv(self.recv) -> msg => match msg {
                         Ok(ArenaMessage::Shutdown(s, d)) => return Ok((s,d)),
                         Ok(msg) => f(msg),
+                        Ok(ArenaMessage::Death(tombstone)) => println!("Death of program {} core {}", tombstone.program_id, tombstone.thread_id),
                         Err(e) => Err(())?
                     },
                 recv(timeout) -> _ => {
